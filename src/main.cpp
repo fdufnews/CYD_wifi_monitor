@@ -290,23 +290,21 @@ void drawAllChannelsLCD(LGFX_CYD& lcd, const int* chCount, const double* chWeigh
   {
     int y = T + (ch - chMin) * rowH;
 
-    // label: "chX  cnt:YY  wt:ZZZ"
+    // label
     lcd.setCursor(L, y);
     lcd.setTextColor(TFT_WHITE, TFT_BLACK);
-    lcd.printf("CH %-2d - %2d ", ch, chCount[ch]);
+    lcd.printf("CH%-2d - %2d", ch, chCount[ch]);
 
     // bar
     int filled = (int)((chWeight[ch] / maxW) * barW + 0.5);
     if (filled < 0) filled = 0;
     if (filled > barW) filled = barW;
 
-    int bx = L + 110;           // bar origin x
-    int by = y - 2;             // small vertical padding
+    int bx = L + 110;
+    int by = y - 2;
     int bh = rowH - 4;
 
-    // background bar
     lcd.fillRect(bx, by, barW, bh, TFT_DARKGREY);
-    // filled portion
     lcd.fillRect(bx, by, filled, bh, TFT_GREEN);
   }
 }
@@ -314,7 +312,7 @@ void drawAllChannelsLCD(LGFX_CYD& lcd, const int* chCount, const double* chWeigh
 // Draw strongest SSIDs on the LCD (using cached data)
 void drawSsidLCD(LGFX_CYD& lcd) 
 {
-  const int maxShow = 15;
+  const int maxShow = 13;  // Show fewer to make room for cache bar
   int show = (gSsidCount < maxShow) ? gSsidCount : maxShow;
 
   // Clear screen and draw title
@@ -324,9 +322,41 @@ void drawSsidLCD(LGFX_CYD& lcd)
   lcd.setCursor(6, 2);
   lcd.print("WiFi Networks");
 
-  // Just show networks in the order they were found - no sorting!
+  // --- CACHE BAR ---
+  const int L = 6;
+  const int W = lcd.width();
   lcd.setTextSize(1);
-  int y = 25;
+  lcd.setTextColor(TFT_WHITE, TFT_BLACK);
+  lcd.setCursor(L, 22);
+  lcd.printf("Cache: %d/%d networks", gSsidCount, MAX_CACHED_SSIDS);
+  
+  // Cache fill bar
+  int cacheBarY = 34;
+  int cacheBarW = W - L - 6;
+  int cacheBarH = 4;
+  float cacheFillPercent = (float)gSsidCount / MAX_CACHED_SSIDS;
+  int cacheFilled = (int)(cacheFillPercent * cacheBarW);
+  
+  // Background bar (dark)
+  lcd.fillRect(L, cacheBarY, cacheBarW, cacheBarH, TFT_DARKGREY);
+  
+  // Filled portion
+  uint16_t cacheColor;
+  if (cacheFillPercent < 0.5) {
+    cacheColor = TFT_GREEN;        // Green < 50%
+  } else if (cacheFillPercent < 0.8) {
+    cacheColor = TFT_YELLOW;       // Yellow 50-80
+  } else {
+    cacheColor = TFT_RED;          // Red > 80
+  }
+  
+  if (cacheFilled > 0) {
+    lcd.fillRect(L, cacheBarY, cacheFilled, cacheBarH, cacheColor);
+  }
+
+  // --- NETWORK LIST ---
+  lcd.setTextSize(1);
+  int y = 45;
   int displayed = 0;
   
   for (int i = 0; i < gSsidCount && displayed < maxShow; i++) 
@@ -357,10 +387,12 @@ void drawSsidLCD(LGFX_CYD& lcd)
     displayed++;
   }
 
-  // Footer
-  lcd.setTextColor(TFT_DARKGREY, TFT_BLACK);
-  lcd.setCursor(6, lcd.height() - 12);
-  lcd.printf("Total cached: %d networks", gSsidCount);
+  // Footer (if there's room)
+  if (y < lcd.height() - 12) {
+    lcd.setTextColor(TFT_DARKGREY, TFT_BLACK);
+    lcd.setCursor(6, lcd.height() - 12);
+    lcd.printf("Showing %d of %d", show, gSsidCount);
+  }
 }
 
 void renderCurrentView() 
