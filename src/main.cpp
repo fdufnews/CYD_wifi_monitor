@@ -11,67 +11,167 @@ static int    gChCount[CH_MAX + 1] = {0};
 static double gChWeight[CH_MAX + 1] = {0.0};
 static int    gLastN = 0;
 
-// cache SSID list so we can draw after scanDelete()
-struct SsidItem { String ssid; int32_t rssi; int32_t ch; };
-static SsidItem gSsidItems[64];
-static int gSsidLen = 0;
+// Persistent SSID cache with timestamps
+struct SsidItem { 
+  String ssid; 
+  int32_t rssi; 
+  int32_t ch; 
+  uint32_t lastSeen;
+  bool active;
+};
+
+static const int MAX_CACHED_SSIDS = 100;  
+static SsidItem gSsidItems[MAX_CACHED_SSIDS];
+static int gSsidCount = 0;  
 
 // async scan state
 static uint32_t gLastScanMs = 0;
-static const uint32_t SCAN_INTERVAL_MS = 3000;
+static const uint32_t SCAN_INTERVAL_MS = 1500;
 static bool gIsScanning = false;
 
-// forward declare so we can call it from pollScanAndTally()
-void renderCurrentView();
+// Screen update tracking
+static uint32_t gLastDataHash = 0;
+static bool gDataChanged = false;
+static uint32_t gLastRedrawMs = 0;
 
-// kick off a background scan (returns immediately)
+// Forward declarations
+void renderCurrentView();
+int findSsidInCache(const String& ssid, int32_t ch);
+void updateSsidCache(const String& ssid, int32_t rssi, int32_t ch, uint32_t timestamp);
+uint32_t calculateDataHash();
+
+// Helper functions
+int findSsidInCache(const String& ssid, int32_t ch) {
+  for (int i = 0; i < gSsidCount; i++) {
+    if (gSsidItems[i].ssid == ssid && gSsidItems[i].ch == ch) {
+      return i;
+    }
+  }
+  return -1;
+}
+
+void updateSsidCache(const String& ssid, int32_t rssi, int32_t ch, uint32_t timestamp) {
+  int idx = findSsidInCache(ssid, ch);
+  
+  if (idx >= 0) {
+    // Update existing entry
+    gSsidItems[idx].rssi = rssi;
+    gSsidItems[idx].lastSeen = timestamp;
+    gSsidItems[idx].active = true;
+  } else {
+    // Add new entry if room
+    if (gSsidCount < MAX_CACHED_SSIDS) {
+      idx = gSsidCount++;
+      gSsidItems[idx].ssid = ssid;
+      gSsidItems[idx].rssi = rssi;
+      gSsidItems[idx].ch = ch;
+      gSsidItems[idx].lastSeen = timestamp;
+      gSsidItems[idx].active = true;
+    }
+  }
+}
+
+uint32_t calculateDataHash() {
+  uint32_t hash = 0;
+  
+  for (int ch = CH_MIN; ch <= CH_MAX; ++ch) {
+    hash = hash * 31 + gChCount[ch];
+    hash = hash * 31 + (uint32_t)((gChWeight[ch] + 5) / 10) * 10;
+  }
+  
+  // Hash active SSID data (only recently seen ones)
+  uint32_t cutoffTime = millis() - 30000;
+  int activeCount = 0;
+
+  String activeSsids[MAX_CACHED_SSIDS];
+  int activeRssis[MAX_CACHED_SSIDS];
+  
+  for (int i = 0; i < gSsidCount; i++) {
+    if (gSsidItems[i].lastSeen > cutoffTime) {
+      activeSsids[activeCount] = gSsidItems[i].ssid;
+      // Round RSSI to nearest 5 dBm to reduce noise
+      activeRssis[activeCount] = ((gSsidItems[i].rssi + 2) / 5) * 5;
+      activeCount++;
+    }
+  }
+  
+  // Simple sorting active networks
+  for (int i = 0; i < activeCount - 1; i++) {
+    for (int j = 0; j < activeCount - i - 1; j++) {
+      if (activeSsids[j] > activeSsids[j + 1]) {
+        String tempStr = activeSsids[j];
+        activeSsids[j] = activeSsids[j + 1];
+        activeSsids[j + 1] = tempStr;
+        
+        int tempRssi = activeRssis[j];
+        activeRssis[j] = activeRssis[j + 1];
+        activeRssis[j + 1] = tempRssi;
+      }
+    }
+  }
+  
+  for (int i = 0; i < activeCount; i++) {
+    hash = hash * 31 + activeSsids[i].length();
+    hash = hash * 31 + activeRssis[i];
+  }
+  hash = hash * 31 + activeCount;
+  
+  return hash;
+}
+
+// -------Scanning---------
+
 void startAsyncScan() 
 {
   if (!gIsScanning) 
   {
-    WiFi.scanNetworks(/*async=*/true, /*show_hidden=*/true);
+    WiFi.scanNetworks(/*async=*/true, /*show_hidden=*/true,/*passive*/false,/*ms_per_ch*/110);
     gIsScanning = true;
     gLastScanMs = millis();
   }
 }
 
-// called repeatedly; when a scan finishes, it tallies results
 void pollScanAndTally() 
 {
   int n = WiFi.scanComplete();         // -1 scanning, -2 idle, >=0 done
 
   if (n == -1) return;                 // still scanning
   if (n == -2) 
-  {                       // idle: maybe start another
+  {                       
     if (!gIsScanning && millis() - gLastScanMs >= SCAN_INTERVAL_MS) 
     {
-      WiFi.scanNetworks(true, true);   // start async scan
+      WiFi.scanNetworks(true, true);   // start scan
       gIsScanning = true;
       gLastScanMs = millis();
     }
     return;
   }
 
-  // n >= 0 → scan finished: tally channels + cache SSIDs
+  uint32_t scanTime = millis();
+  int oldSsidCount = gSsidCount;  // Remember how many we had before
+
   for (int ch = CH_MIN; ch <= CH_MAX; ++ch) 
   {
     gChCount[ch]  = 0;
     gChWeight[ch] = 0.0;
   }
 
-  gSsidLen = 0;
-  int m = (n > 64) ? 64 : n;
+  // Mark all as inactive for this scan
+  for (int i = 0; i < gSsidCount; i++) {
+    gSsidItems[i].active = false;
+  }
 
+  // Process scan results
   for (int i = 0; i < n; ++i) 
   {
+    String ssid = WiFi.SSID(i);
     int32_t rssi = WiFi.RSSI(i);
     int32_t chan = WiFi.channel(i);
-    if (i < m) 
-    {
-      gSsidItems[i].ssid = WiFi.SSID(i);
-      gSsidItems[i].rssi = rssi;
-      gSsidItems[i].ch   = chan;
-    }
+    
+    // Update SSID cache
+    updateSsidCache(ssid, rssi, chan, scanTime);
+    
+    // Tally channel usage
     if (chan >= CH_MIN && chan <= CH_MAX) 
     {
       gChCount[chan] += 1;
@@ -79,15 +179,42 @@ void pollScanAndTally()
       gChWeight[chan] += w;
     }
   }
-  gSsidLen = m;
-  gLastN   = n;
 
-  WiFi.scanDelete();    // free buffers now that we cached data
+  gLastN = n;
+  WiFi.scanDelete();
   gIsScanning = false;
 
-  // redraw immediately with fresh data
-  renderCurrentView();
+  // Redraw on new networks
+  if (gSsidCount > oldSsidCount) {
+    Serial.printf("New networks found- Cache: %d -> %d\n", oldSsidCount, gSsidCount);
+    renderCurrentView();
+  }
 }
+
+void doScanAndTally() 
+{
+  int n = WiFi.scanNetworks(false, true);   // blocking is fine here
+  // reset tallies
+  for (int ch = CH_MIN; ch <= CH_MAX; ++ch) {
+    gChCount[ch] = 0;
+    gChWeight[ch] = 0.0;
+  }
+  if (n > 0) {
+    for (int i = 0; i < n; ++i) {
+      int32_t rssi = WiFi.RSSI(i);
+      int32_t chan = WiFi.channel(i);
+      if (chan >= CH_MIN && chan <= CH_MAX) {
+        gChCount[chan] += 1;
+        int w = 100 + (int)rssi; if (w < 0) w = 0;
+        gChWeight[chan] += w;
+      }
+    }
+  }
+  gLastN = n;
+  gLastScanMs = millis();
+}
+
+// ------- LAYOUT ---------
 
 void drawBar(double value, double maxValue, int width = 40) 
 {
@@ -166,7 +293,7 @@ void drawAllChannelsLCD(LGFX_CYD& lcd, const int* chCount, const double* chWeigh
     // label: "chX  cnt:YY  wt:ZZZ"
     lcd.setCursor(L, y);
     lcd.setTextColor(TFT_WHITE, TFT_BLACK);
-    lcd.printf("ch%-2d  cnt:%2d  wt:", ch, chCount[ch]);
+    lcd.printf("CH %-2d - %2d ", ch, chCount[ch]);
 
     // bar
     int filled = (int)((chWeight[ch] / maxW) * barW + 0.5);
@@ -184,98 +311,71 @@ void drawAllChannelsLCD(LGFX_CYD& lcd, const int* chCount, const double* chWeigh
   }
 }
 
-// Draw strongest SSIDs on the LCD (top 12 by RSSI).
+// Draw strongest SSIDs on the LCD (using cached data)
 void drawSsidLCD(LGFX_CYD& lcd) 
 {
   const int maxShow = 15;
+  int show = (gSsidCount < maxShow) ? gSsidCount : maxShow;
 
-  // build an index list [0..gSsidLen-1]
-  int m = gSsidLen;
-  if (m > 64) m = 64;
-  int show = (m < maxShow) ? m : maxShow;
-  int idx[64];
-  for (int i = 0; i < m; ++i) idx[i] = i;
-
-  // partial selection sort: top 'show' by RSSI desc
-  for (int i = 0; i < show; ++i) 
-  {
-    int best = i;
-    for (int j = i + 1; j < m; ++j) 
-    {
-      if (gSsidItems[idx[j]].rssi > gSsidItems[idx[best]].rssi) best = j;
-    }
-    if (best != i) { int t = idx[i]; idx[i] = idx[best]; idx[best] = t; }
-  }
-
-  // Draw
+  // Clear screen and draw title
   lcd.fillScreen(TFT_BLACK);
   lcd.setTextColor(TFT_GREEN, TFT_BLACK);
   lcd.setTextSize(2);
   lcd.setCursor(6, 2);
-  lcd.print("SSID Feed (top by RSSI)");
+  lcd.print("WiFi Networks");
 
+  // Just show networks in the order they were found - no sorting!
   lcd.setTextSize(1);
-  int y = 24;
-  for (int i = 0; i < show; ++i) 
+  int y = 25;
+  int displayed = 0;
+  
+  for (int i = 0; i < gSsidCount && displayed < maxShow; i++) 
   {
-    const SsidItem& it = gSsidItems[idx[i]];
-    // line: rank, ch, RSSI, SSID (trim long names)
-    String name = it.ssid;
-    if (name.length() > 22) name = name.substring(0, 22) + "...";
+    const SsidItem& network = gSsidItems[i];
+    
+    // Trim long SSID names
+    String name = network.ssid;
+    if (name.length() > 20) {
+      name = name.substring(0, 20) + "..";
+    }
 
     lcd.setCursor(6, y);
-    lcd.setTextColor(TFT_GREEN, TFT_BLACK);
-    lcd.printf("%2d) ch%-2ld  RSSI:%4ld  ", i + 1, (long)it.ch, (long)it.rssi);
-
-    lcd.setTextColor(TFT_WHITE, TFT_BLACK);
+    
+    // Color: green for active, white for cached
+    if (network.active) {
+      lcd.setTextColor(TFT_GREEN, TFT_BLACK);
+      lcd.print("*");
+    } else {
+      lcd.setTextColor(TFT_WHITE, TFT_BLACK);
+      lcd.print(" ");
+    }
+    
+    lcd.printf("%2d) ch%-2d %4ddBm ", displayed + 1, network.ch, network.rssi);
     lcd.print(name);
+    
     y += 14;
+    displayed++;
   }
 
-  // footer hint
+  // Footer
   lcd.setTextColor(TFT_DARKGREY, TFT_BLACK);
   lcd.setCursor(6, lcd.height() - 12);
-  lcd.print("Tap to toggle view");
-}
-
-void doScanAndTally() 
-{
-  int n = WiFi.scanNetworks(false, true);   // blocking is fine here
-  // reset tallies
-  for (int ch = CH_MIN; ch <= CH_MAX; ++ch) {
-    gChCount[ch] = 0;
-    gChWeight[ch] = 0.0;
-  }
-  if (n > 0) {
-    for (int i = 0; i < n; ++i) {
-      int32_t rssi = WiFi.RSSI(i);
-      int32_t chan = WiFi.channel(i);
-      if (chan >= CH_MIN && chan <= CH_MAX) {
-        gChCount[chan] += 1;
-        int w = 100 + (int)rssi; if (w < 0) w = 0;
-        gChWeight[chan] += w;
-      }
-    }
-  }
-  gLastN = n;
-  gLastScanMs = millis();
+  lcd.printf("Total cached: %d networks", gSsidCount);
 }
 
 void renderCurrentView() 
 {
   if (gView == VIEW_ALL) 
   {
-    // (Serial optional)
-    // drawAllChannelsBars(gChCount, gChWeight, CH_MIN, CH_MAX, 40);
     drawAllChannelsLCD(lcd, gChCount, gChWeight, CH_MIN, CH_MAX);
   } 
   else 
-  { // VIEW_SSID
-    // (Serial optional)
-    // drawSsidFeed(gLastN);
+  { 
     drawSsidLCD(lcd);
   }
 }
+
+// --------- MAIN LOOP AND SETUP -------------
 
 void setup() 
 {
@@ -314,7 +414,10 @@ void loop()
   if (wasDown && !down && (now - lastToggle) > 250) {
     gView = (gView == VIEW_ALL) ? VIEW_SSID : VIEW_ALL;
     lastToggle = now;
-    renderCurrentView();              // <- redraw right away
+    
+    Serial.printf("View changed to: %s\n", gView == VIEW_ALL ? "CHANNELS" : "SSIDS");
+    renderCurrentView();              // <- redraw right away for view change
+    gLastRedrawMs = now;
   }
   wasDown = down;
 
