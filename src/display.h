@@ -1,6 +1,7 @@
 #pragma once
 #include <LovyanGFX.hpp>
 
+#if ESP32DEV
 // CYD guess: SPI + ILI9341 (240x320). Adjust pins if needed.
 class LGFX_CYD : public lgfx::LGFX_Device {
 public:
@@ -80,6 +81,74 @@ private:
   lgfx::Light_PWM      _light_instance;
   lgfx::Touch_XPT2046 _touch_instance;
 };
+#elif ESP32_2432S022
+// ESP32 with ST7789 panel on 8 bit parallel bus, touchscreen with CST820
+class LGFX_CYD : public lgfx::LGFX_Device {
+public:
+  LGFX_CYD() 
+  {
+    { // --- Parallel bus ---
+      auto cfg = _bus_instance.config();
+      cfg.freq_write = 25000000;
+      cfg.pin_wr =  4;              // WR
+      cfg.pin_rd =  2;              // RD
+      cfg.pin_rs = 16;              // RS(D/C)
+      cfg.pin_d0 = 15;              // D0
+      cfg.pin_d1 = 13;              // D1
+      cfg.pin_d2 = 12;              // D2
+      cfg.pin_d3 = 14;              // D3
+      cfg.pin_d4 = 27;              // D4
+      cfg.pin_d5 = 25;              // D5
+      cfg.pin_d6 = 33;              // D6
+      cfg.pin_d7 = 32;              // D7
+
+      _bus_instance.config(cfg);
+      _panel_instance.setBus(&_bus_instance);
+    }
+    { // --- PANEL config (ST7789) ---
+      auto cfg = _panel_instance.config();
+
+      cfg.pin_cs   = 17;             
+      cfg.pin_rst  = -1;             // (-1 if no RESET)
+      cfg.pin_busy = -1;            // not used
+
+      cfg.memory_width   = 240;
+      cfg.memory_height  = 320;
+      cfg.panel_width    = 240;
+      cfg.panel_height   = 320;
+      cfg.offset_x       = 0;
+      cfg.offset_y       = 0;
+      cfg.offset_rotation= 0;
+      cfg.dummy_read_pixel = 0;
+      cfg.dummy_read_bits  = 0;
+      cfg.readable       = false;
+      cfg.invert         = false;
+      cfg.rgb_order      = false;
+      cfg.dlen_16bit     = false;
+      cfg.bus_shared     = true;
+
+      _panel_instance.config(cfg);
+    }
+    
+    { // --- BACKLIGHT (PWM) ---
+      auto cfg = _light_instance.config();
+      cfg.pin_bl      = 0;
+      cfg.invert      = false;
+      cfg.freq        = 44100;
+      cfg.pwm_channel = 7;
+      _light_instance.config(cfg);
+      _panel_instance.setLight(&_light_instance);
+    }
+    setPanel(&_panel_instance);
+  }
+
+private:
+  lgfx::Bus_Parallel8 _bus_instance;
+  lgfx::Panel_ST7789  _panel_instance;
+  lgfx::Light_PWM     _light_instance;
+};
+
+#endif
 
 // Global
 extern LGFX_CYD lcd;

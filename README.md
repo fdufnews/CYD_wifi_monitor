@@ -1,5 +1,15 @@
 # 📡 CYD Wi-Fi Air Monitor
 
+This project is a fork of [lukeswitz/CYD_wifi_monitor](https://github.com/lukeswitz/CYD_wifi_monitor)
+
+If made modifications :
+- to support ESP32-2432S022 CYD board which has a different TFT screen and a different touchscreen too.
+- to add some enhancement like colors to have better view of the Congestions or of the RSSI of the access points.
+- to have a real time view of the RSSI (currently an automatic screen refresh every 5s)
+
+Here under is the original README.md content
+<hr>
+
 A simple Wi-Fi congestion monitor for the **Cheap Yellow Display (CYD)**  
 (ESP32 + 2.8" ILI9341 TFT + XPT2046 touchscreen).  
  

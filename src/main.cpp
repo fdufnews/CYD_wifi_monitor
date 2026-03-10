@@ -1,12 +1,16 @@
 #include <Arduino.h>
 #include <WiFi.h>
 #include "display.h"
+#if ESP32_2432S022
+#include "CST820.h"
+#endif
 
 enum ViewMode { VIEW_ALL = 0, VIEW_SSID = 1 };
 ViewMode gView = VIEW_ALL;
+ViewMode prev_gView = VIEW_SSID;
 
 // cached scan results (2.4 GHz)
-static const int CH_MIN = 1, CH_MAX = 11;
+static const int CH_MIN = 1, CH_MAX = 13;
 static int    gChCount[CH_MAX + 1] = {0};
 static double gChWeight[CH_MAX + 1] = {0.0};
 static int    gLastN = 0;
@@ -28,6 +32,15 @@ static int gSsidCount = 0;
 static uint32_t gLastScanMs = 0;
 static const uint32_t SCAN_INTERVAL_MS = 1500;
 static bool gIsScanning = false;
+static uint32_t gLastRenderMs = 0;
+static const uint32_t RENDER_INTERVAL_MS = 5000;
+
+#if ESP32_2432S022
+// Touch screen
+#define I2C_SDA 21
+#define I2C_SCL 22
+CST820 touch(I2C_SDA, I2C_SCL, -1, -1);
+#endif
 
 // Screen update tracking
 static uint32_t gLastDataHash = 0;
@@ -185,8 +198,9 @@ void pollScanAndTally()
   gIsScanning = false;
 
   // Redraw on new networks
-  if (gSsidCount > oldSsidCount) {
-    Serial.printf("New networks found- Cache: %d -> %d\n", oldSsidCount, gSsidCount);
+  if ((gSsidCount > oldSsidCount) || (gLastRenderMs - millis() > RENDER_INTERVAL_MS)) {
+    gLastRenderMs = millis();
+    Serial.printf("New networks found- Cache: %d -> %d\n\r", oldSsidCount, gSsidCount);
     renderCurrentView();
   }
 }
@@ -216,6 +230,22 @@ void doScanAndTally()
 
 // ------- LAYOUT ---------
 
+int colorList[] = {TFT_BLACK, TFT_GREEN, TFT_YELLOW, TFT_ORANGE, TFT_RED};
+
+int16_t rssiToColor(uint32_t rssi){
+  int16_t color;
+  if (rssi <= -90){
+    color = TFT_RED;
+  } else if ((rssi > -90) && (rssi <= -80)){
+    color = TFT_ORANGE;
+  } else if ((rssi > -80) && (rssi <= -70)){
+    color = TFT_YELLOW;
+  } else {
+    color = TFT_GREEN;
+  }
+  return color;
+}
+
 void drawBar(double value, double maxValue, int width = 40) 
 {
   int n = 0;
@@ -230,7 +260,7 @@ void drawBar(double value, double maxValue, int width = 40)
 
 void drawSsidFeed(int n)
 {
-  Serial.printf("Found %d networks \n", n);
+  Serial.printf("Found %d networks \n\r", n);
     for (int i = 0; i < n; i++)
     {
       String ssid = WiFi.SSID(i);
@@ -238,7 +268,7 @@ void drawSsidFeed(int n)
       int32_t chan  = WiFi.channel(i);
       wifi_auth_mode_t enc = (wifi_auth_mode_t)WiFi.encryptionType(i);
 
-      Serial.printf("%2d) ch%-2ld  %-32s  RSSI:%4ld dBm  sec:%d\n", i+1, (long)chan, ssid.c_str(), (long)rssi, (int)enc); //ssid list
+      Serial.printf("%2d) ch%-2ld  %-32s  RSSI:%4ld dBm  sec:%d\n\r", i+1, (long)chan, ssid.c_str(), (long)rssi, (int)enc); //ssid list
     }
 }
 
@@ -266,7 +296,8 @@ void drawAllChannelsLCD(LGFX_CYD& lcd, const int* chCount, const double* chWeigh
   const int L = 6;    // left margin
   const int T = 25;   // top margin (leave room for title)
   const int R = 6;    // right margin
-  const int rowH = 18;                 // row height per channel
+  const int rowH = 16;                 // row height per channel
+  const int rowSpace = 2;     // space between rows
   const int barW = W - L - R - 110;    // pixels reserved for bar (rest for labels)
 
   // find max for scaling
@@ -278,7 +309,6 @@ void drawAllChannelsLCD(LGFX_CYD& lcd, const int* chCount, const double* chWeigh
   if (maxW <= 0) maxW = 1.0; // avoid divide by zero
 
   // clear and title
-  lcd.fillScreen(TFT_BLACK);
   lcd.setTextColor(TFT_GREEN, TFT_BLACK);
   lcd.setTextSize(2);
   lcd.setCursor(L, 2);
@@ -286,12 +316,15 @@ void drawAllChannelsLCD(LGFX_CYD& lcd, const int* chCount, const double* chWeigh
 
   // rows
   lcd.setTextSize(1);
+  int labelOffset = (rowH - lcd.fontHeight()) >> 1;  // to center the label in the bar height
   for (int ch = chMin; ch <= chMax; ++ch) 
   {
     int y = T + (ch - chMin) * rowH;
 
+    lcd.fillRect(0, y, rowH - rowSpace, L, TFT_BLACK);
+
     // label
-    lcd.setCursor(L, y);
+    lcd.setCursor(L, y + labelOffset);
     lcd.setTextColor(TFT_WHITE, TFT_BLACK);
     lcd.printf("CH%-2d - %2d", ch, chCount[ch]);
 
@@ -301,11 +334,12 @@ void drawAllChannelsLCD(LGFX_CYD& lcd, const int* chCount, const double* chWeigh
     if (filled > barW) filled = barW;
 
     int bx = L + 110;
-    int by = y - 2;
-    int bh = rowH - 4;
+    int by = y - (rowSpace >> 1);
+    int bh = rowH - rowSpace;
 
+    int color = colorList[min(chCount[ch], 4)];
     lcd.fillRect(bx, by, barW, bh, TFT_DARKGREY);
-    lcd.fillRect(bx, by, filled, bh, TFT_GREEN);
+    lcd.fillRect(bx, by, filled, bh, color);
   }
 }
 
@@ -358,15 +392,16 @@ void drawSsidLCD(LGFX_CYD& lcd)
   lcd.setTextSize(1);
   int y = 45;
   int displayed = 0;
-  
+  int colorRssi;
+
   for (int i = 0; i < gSsidCount && displayed < maxShow; i++) 
   {
     const SsidItem& network = gSsidItems[i];
     
     // Trim long SSID names
     String name = network.ssid;
-    if (name.length() > 20) {
-      name = name.substring(0, 20) + "..";
+    if (name.length() > 30) {
+      name = name.substring(0, 30) + "..";
     }
 
     lcd.setCursor(6, y);
@@ -374,13 +409,18 @@ void drawSsidLCD(LGFX_CYD& lcd)
     // Color: green for active, white for cached
     if (network.active) {
       lcd.setTextColor(TFT_GREEN, TFT_BLACK);
+      colorRssi = rssiToColor(network.rssi);
       lcd.print("*");
     } else {
       lcd.setTextColor(TFT_WHITE, TFT_BLACK);
+      colorRssi = TFT_WHITE;
       lcd.print(" ");
     }
     
-    lcd.printf("%2d) ch%-2d %4ddBm ", displayed + 1, network.ch, network.rssi);
+    lcd.printf("%2d) ch%-2d ", displayed + 1, network.ch);
+    lcd.setTextColor(colorRssi, TFT_BLACK);
+    lcd.printf("%4ddBm ", network.rssi);
+    lcd.setTextColor(TFT_GREEN, TFT_BLACK);
     lcd.print(name);
     
     y += 14;
@@ -397,13 +437,18 @@ void drawSsidLCD(LGFX_CYD& lcd)
 
 void renderCurrentView() 
 {
+  if (prev_gView != gView){
+      lcd.fillScreen(TFT_BLACK);
+  }
   if (gView == VIEW_ALL) 
   {
     drawAllChannelsLCD(lcd, gChCount, gChWeight, CH_MIN, CH_MAX);
+    prev_gView = gView;
   } 
   else 
   { 
     drawSsidLCD(lcd);
+    prev_gView = gView;
   }
 }
 
@@ -423,7 +468,11 @@ void setup()
   lcd.setRotation(1);    // try 1 (landscape). Try 0/2/3 if orientation is weird.
   lcd.setColorDepth(16);
   lcd.setBrightness(200);// 0..255 (if BL pin is correct)
-
+  
+  #if ESP32_2432S022
+  // touch screen initialization
+  touch.begin();
+  #endif
 }
 
 void loop() 
@@ -431,8 +480,14 @@ void loop()
   // --- input: tap or 't' toggles immediately ---
   static bool wasDown = false;
   static uint32_t lastToggle = 0;
+  #if ESP32DEV
   int32_t tx, ty;
   bool down = lcd.getTouch(&tx, &ty);
+  #elif ESP32_2432S022
+  uint16_t tx, ty;
+  uint8_t gesture;
+  bool down = touch.getTouch(&tx, &ty, &gesture);
+  #endif
 
   if (Serial.available() > 0) 
   {
@@ -447,7 +502,7 @@ void loop()
     gView = (gView == VIEW_ALL) ? VIEW_SSID : VIEW_ALL;
     lastToggle = now;
     
-    Serial.printf("View changed to: %s\n", gView == VIEW_ALL ? "CHANNELS" : "SSIDS");
+    Serial.printf("View changed to: %s\n\r", gView == VIEW_ALL ? "CHANNELS" : "SSIDS");
     renderCurrentView();              // <- redraw right away for view change
     gLastRedrawMs = now;
   }
